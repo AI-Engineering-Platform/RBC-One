@@ -1,213 +1,328 @@
-# Agentic Forecasting
+# BoC Rate Decisions
 
-A foundation for building, evaluating, and comparing forecasting systems — conventional numerical models, LLM Processes, and agentic forecasters — on real economic, financial, and event-prediction tasks.
+> **Reference implementation 4 of 4.** Recommended order: [getting_started](../getting_started/) → [S&P 500](../sp500_forecasting/) → [food CPI](../food_price_forecasting/) → [energy / WTI](../energy_oil_forecasting/) → **BoC rate decisions**. Each stands on its own.
 
-## Contents
+Predicts the **direction of the Bank of Canada's decision at the next fixed
+announcement date** — cut, hold, or hike — as a calibrated probability
+distribution issued **four weeks (28 days) before the announcement**. This
+is the repository's reference implementation for **discrete event
+prediction**. Where every other use case forecasts a continuous trajectory
+and scores it with CRPS, this one resolves an ordered categorical outcome
+on an irregular meeting calendar and scores distributions with the
+**Ranked Probability Score (RPS)**.
 
-The repo has two layers. A small core library (`aieng.forecasting`) owns cutoff-safe data handling, a shared `Predictor` interface, reusable methods, and the backtest/evaluation harness. Self-contained **reference implementations** under [`implementations/`](implementations/) apply those methods to real forecasting problems — pick the one closest to what you want to build; each directory has its own README.
+The 28-day lead is the point: on the eve of a decision the 2-year GoC yield
+has already absorbed the market consensus, so a T−1 "forecast" mostly reads
+market pricing off a curve. Four weeks out the decision is genuinely
+uncertain, and the skill being measured is *anticipating cycle turns before
+the market converges*. An eve-of-decision (T−1) diagnostic variant is kept
+alongside; notebook 02 compares the two leads directly.
 
-| # | Implementation | Use case | Methods |
-| --- | --- | --- | --- |
-| 0 | [Getting started](implementations/getting_started/) | Canada CPI gasoline, one month ahead — the smallest end-to-end loop | Naive last-value, AutoARIMA; CRPS via `backtest()` / `evaluate()` |
-| 1 | [S&P 500](implementations/sp500_forecasting/) | Daily index returns under a leak-safe macro/market covariate panel (1 / 5 / 21 business-day horizons) | Naive, ETS, Kalman, AutoARIMA, linear regression, LightGBM; covariate-aware LLM-Process |
-| 2 | [Food price forecasting](implementations/food_price_forecasting/) | Multivariate Canadian food CPI in the style of Canada's Food Price Report (nine sub-indices, 12-month trajectory, avg/avg YoY) | Naive last-value, AutoARIMA; report-grounded LLM-Process (quantile grid and sampled trajectory) |
-| 3 | [Energy / oil](implementations/energy_oil_forecasting/) | Daily WTI crude under regime-breaking news (continuous trajectory, binary up-shock, scenario analysis) | Prophet, LLM-Process, news-grounded agent, code-executing agent, adaptive (curriculum-trained) agent |
-| 4 | [BoC rate decisions](implementations/boc_rate_decisions/) | Will the Bank of Canada cut, hold, or hike at its next meeting? (ordered categorical; binary cut-vs-not special case) | Climatological frequency, multinomial logistic, categorical LLM-Process, analyst agent; LLM-as-judge reasoning alignment |
+It is the validation surface for the discrete half of the evaluation
+harness: `ForecastingTask.payload_type == "categorical"` with ordered
+`categories`, `CategoricalForecast` payloads, RPS dispatch in
+`backtest()`/`evaluate()`, and explicit `origin_dates` on specs. The
+**binary special case** (*cut vs no cut*, `payload_type == "binary"`,
+Brier-scored) is kept alongside as a compact copy-paste reference for
+naturally binary problems — prediction-market-style questions — and the
+experiment notebook opens with it as a warm-up, including a numerical check
+of the RPS(K=2) ≡ Brier identity.
 
-Also in this README: [Setup](#setup) · [Core concepts](#core-concepts) · [Repository layout](#repository-layout) · [Documentation](#documentation)
+This is the repository's only discrete-event reference implementation: come
+here to see the same evaluation harness applied to a problem that is not a time
+series. For the minimal continuous-forecasting loop, see
+[`getting_started/`](../getting_started/).
 
-> **👉 First time here? Run the environment check.** After `uv sync` (see [Setup](#setup)), open [`implementations/getting_started/00_environment_check.ipynb`](implementations/getting_started/00_environment_check.ipynb) and run it top to bottom. It's a self-guided preflight that verifies every capability — proxy LLM inference, Langfuse, E2B code execution, StatCan/FRED data access, and an end-to-end mini backtest — and tells you exactly what to fix when something isn't set up. **Do this before anything else.**
+---
 
-## What's here
+## Prediction task
 
-- **Core library** — `aieng-forecasting` (`aieng.forecasting`): data services, cutoff enforcement, forecasting tasks, prediction payloads, backtesting, evaluation, and artifacts.
-- **Reusable methods** — `aieng.forecasting.methods`: `Predictor` implementations including naive baselines (continuous, binary, and categorical), Darts numerical predictors, LLM-process predictors (continuous, binary-probability, and categorical-probability), and ADK-based agentic infrastructure (`build_adk_agent`, `AdkTextRunner`, `AgentPredictor`).
-- **Reference implementations** — `implementations/<use-case>/`: notebooks, helper modules, task-specific configuration, and co-located YAML specs.
-- **Tracing** — Langfuse / OpenTelemetry bootstrap (`aieng.forecasting.langfuse_tracing`) for LiteLLM and Google ADK. Agent `search_web` calls nest inner search and leakage-verifier generations in the same trace.
-- **Data scripts** — `scripts/`: one fetch script per data source, plus `build_e2b_template.py` for the agentic code-execution sandbox.
+**Question:** at the fixed announcement date occurring 28 days after the
+forecast origin, will the Bank of Canada CUT, HOLD, or HIKE its target for
+the overnight rate? Outcome is the direction of the change (any size).
 
-## Two ways to use a forecaster
+- **Target series:** `boc_rate_decision_direction` — derived −1/0/+1
+  series, one observation per fixed announcement date (8 per year),
+  `released_at` = the announcement date itself.
+- **Categories (ordered):** `cut(−1) < hold(0) < hike(+1)` — declared on the
+  task via `categories`, which is what makes RPS distance-sensitive: mass on
+  *hike* when the Bank cuts is penalised through two cumulative thresholds,
+  mass on *hold* through one.
+- **Origins:** `announcement_date − 28 days`, listed explicitly in the
+  specs via `origin_dates` (the meeting calendar is irregular; a stride
+  cannot produce it). Scheduled meetings are never closer than 35 days
+  apart, so the previous decision is always visible at the origin. A
+  use-case test (`test_specs.py`) asserts the origin lists stay consistent
+  with `meeting_schedule.yaml`.
+- **Horizon:** 28 days — the forecast date lands exactly on the
+  announcement, and cutoff enforcement excludes everything after the
+  origin.
+- **Eve diagnostic:** `boc_rate_direction_eve_smoke.yaml` keeps
+  the T−1 framing (task id `boc_rate_direction_next_meeting_eve`) for the
+  lead-time comparison in notebook 02 — the RPS gap between T−28 and T−1
+  separates anticipation from eve-of-decision market reading.
+- **Metric:** unnormalized RPS (the Epstein/Murphy cumulative form: for
+  \(K = 2\) it equals the binary Brier score \((p-y)^2\); Brier's original
+  1950 multi-category score is twice this — both conventions circulate).
+  The headline comparison is the skill score against the climatological
+  distribution. With holds at ~76%, climatology is a deceptively low bar
+  that conditions-blind models struggle to clear.
+- **Binary view:** `boc_rate_cut_event` (0/1, 1 = cut) remains registered
+  and the binary smoke/backtest specs are kept as the compact reference.
 
-Every method can be used in one of two modes, and the distinction runs through the library:
+**Excluded by design:** unscheduled (emergency) announcements — there have
+been exactly two since 2009 (March 13 and March 27, 2020, the COVID-19
+intermeeting cuts). They are recorded in the calendar file and used for
+validation, but no forecast origin targets them.
 
-- **Track 1 — evaluated prediction.** Numerical methods, LLM Processes, and agentic forecasters emit standardized `Prediction` objects and are compared head-to-head with the evaluation harness (CRPS, Brier, RPS, calibration).
-- **Track 2 — interactive analysis.** The same agents can do scenario analysis, monitoring, open-ended Q&A, code-backed analysis, and reasoning over evidence — useful work that isn't reduced to a single score.
+---
 
-## Reference implementations
+## Data
 
-Use cases, methods, and links are in the [contents](#contents) table above. Each implementation is independent — pick the problem you care about and read that directory's `README.md` for the full walkthrough. They are numbered in a recommended order that mirrors the bootcamp progression — conventional numerical methods → LLM Processes → agents → agentic evaluation — but any one stands on its own.
+| Ingredient | Source | Notes |
+|---|---|---|
+| Daily target for the overnight rate | StatCan 10-10-0139-01 (`StatCanAdapter`, `release_lag_days=1`) | The raw policy path |
+| Fixed announcement dates 2009–2026 | `meeting_schedule.yaml` (committed, curated) | Required to observe *holds*; sourced from the Bank's announcement archive, validated against the rate series |
+| `boc_rate_decision_direction` | `BoCDecisionEventAdapter(kind="direction")` | Joins calendar + daily rate into −1/0/+1; robust to the 2021 effective-date regime change |
+| `boc_rate_cut_event` | `BoCDecisionEventAdapter(kind="cut")` | The binary view of the same derivation |
+| 2-year GoC benchmark yield | StatCan 10-10-0139-01 | Market-implied policy expectations — the strongest single covariate, and naturally directional |
+| US Treasury 2-year yield | FRED DGS2 | Combined with the GoC 2-year yield to form the Fed-BoC 2Y differential |
+| CPI-median and CPI-trim | StatCan 18-10-0256-01 | Bank of Canada core measures of persistent inflation relative to the 2% target |
+| Unemployment rate | FRED `LRUNTTTTCAM156S` | Labour-market pressure |
+| BoC rate-announcement press releases | Bank of Canada announcement pages (`scripts/fetch_boc_press_releases.py`) | One release per scheduled meeting, cached to `data/reports/boc_press_releases/`; served cutoff-aware by `PressReleaseStore` (only releases published on or before the origin are visible). The published-rationale source for the reasoning-alignment evaluator, and forecast context for the press-release agent variant (`build_boc_press_release_config`: the latest release visible at the origin, i.e. the previous meeting's statement); still a context seam for the LLMP |
+| Market Participants Survey | Bank of Canada quarterly survey pages (`scripts/fetch_boc_market_survey.py`) | ~30 market participants' expected policy-rate path (25th/median/75th percentile per upcoming meeting), balance of risks, and macro forecasts; parsed to `data/reports/boc_market_survey/` and served by `MarketSurveyStore` (visible only when published strictly before the origin — surveys are conducted weeks earlier). Starts with the Q4 2022 survey (published 2023-02-06), so it covers only the last 15 backtest meetings and the whole post-2025 eval. Forecast context for the market-survey agent variants |
 
-**Start here → #0 [`getting_started/`](implementations/getting_started/)** if the evaluation loop is new to you. That directory also includes [`99_repo_concierge.ipynb`](implementations/getting_started/99_repo_concierge.ipynb) — a lite-model repo guide for “how does this codebase work?” questions (`uv run adk run implementations/getting_started/concierge_agent` from the repo root).
-
-**Not sure where to start building?** Each of the four domain implementations (#1–#4) ends with a `99_starter_agent.ipynb` — a fresh, hackable **starter agent** (a `starter_agent/` module) with toggleable news search and code execution, two lightweight tool-usage skills, an interactive cell, and one scored forecast. It's the consistent "continue from here" entry point for taking any reference use case in an agentic direction, and a quick end-to-end test of that use case's agent stack.
-
-## Time Series Data sources
-
-- **StatCan** — Canadian CPI and related macroeconomic series.
-- **FRED** — macroeconomic and commodity series.
-- **yfinance** — equities, indices, and commodity futures.
-
-Historical data is cached locally under `data/` and is not committed. Each implementation's README names the fetch script(s) it needs.
-
-### FRED API key
-
-Several reference implementations (S&P 500, BoC rate decisions) fetch data from the Federal Reserve Economic Data (FRED) API, which requires a free personal API key. **We cannot provide this key for you** — each participant must request their own at:
-
-> [https://fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html)
-
-FRED keys are free and approval is typically quick, but it can occasionally take some time, so request yours early. When asked for a use-case description, something extended from the following works well:
-
-> "Requesting an API key to explore the effectiveness of various forecasting techniques on economic data."
-
-Once you have the key, add it to your repo-root `.env`:
-
-```
-FRED_API_KEY=your_fred_api_key
-```
-
-On Coder workspaces, bootcamp keys (`OPENAI_*`, `E2B_*`, `LANGFUSE_*`) live in your shell environment — **not** in repo `.env`. See [Bootcamp environment](#bootcamp-environment-coder).
-
-## Repository layout
-
-```text
-aieng-forecasting/   # Installable library: import as aieng.forecasting
-implementations/     # Self-contained reference implementations + co-located specs
-guides/              # Step-by-step strategy guides for common build-phase tasks
-scripts/             # Data-fetch scripts + E2B template builder
-tests/               # Onboarding integration tests (not run in CI)
-planning-docs/       # Architecture notes and the extension/roadmap catalog
-playground/          # Exploration and archived demos (not reference implementations)
-```
-
-## Setup
-
-Install dependencies from the repo root:
-
-```bash
-git clone <repo-url>. # If running locally. Coder environment setup clones repo automatically.
-cd agentic-forecasting
-uv sync --dev
-```
-
-**macOS — LightGBM and OpenMP.** The library depends on **LightGBM** (used by `DartsLightGBMPredictor` and some notebooks). The PyPI wheel expects **OpenMP** at runtime. If you see `Library not loaded: @rpath/libomp.dylib` when importing or training, install Homebrew's OpenMP once and restart your shell or Jupyter kernel:
-
-```bash
-brew install libomp
-```
-
-On Apple Silicon the dylib is typically under `/opt/homebrew/opt/libomp/lib/`; on Intel Homebrew, `/usr/local/opt/libomp/lib/`.
-
-### Coder Workspaces
-
-When you open a **Coder workspace**, startup runs automatically in the background. By the time you connect you should have:
-
-- The repo cloned, a Python venv, and dependencies installed
-- Bootcamp API keys (`OPENAI_*`, `E2B_*`, `LANGFUSE_*`) available in your shell (not in `.env`)
-- A shell that opens in the repo with the venv activated
-
-**Your next step:** run [`00_environment_check.ipynb`](implementations/getting_started/00_environment_check.ipynb) top to bottom. That notebook will confirm that startup succeeded.
-
-**ADK web UI.** [Guide 5](guides/05-access-adk-web-via-ssh-tunnel.md) is how you serve the concierge (or any other bootcamp agent) in the browser. On Coder, `adk web` binds to `localhost` *inside* the workspace — the same guide tunnels that port to your laptop (macOS, Windows, and Linux). Skip the tunnel half if you are running the repo locally.
-
-On first boot, keys are verified against live services and your onboarding status is recorded. Workspace restarts reload keys without re-running the full test suite.
-
-**Local machine or troubleshooting** — fetch and verify keys manually:
+Populate the cache once:
 
 ```bash
-eval "$(onboard --bootcamp-name agentic-forecasting --test-script tests/test_integration.py)"
+uv run python scripts/fetch_boc.py                 # series: rate, 2yr yield, CPI, unemployment
+uv run python scripts/fetch_boc_press_releases.py  # press releases (rationale-alignment eval + agent context)
+uv run python scripts/fetch_boc_market_survey.py   # Market Participants Surveys (agent context, 2023+)
 ```
 
-Reload keys in a new shell without re-testing:
+`fetch_boc.py` uses the FRED API for the unemployment covariate (`FRED_API_KEY` in
+your repo-root `.env`); the script degrades gracefully without it, but the unemployment
+feature will be absent. FRED keys are free but must be requested individually —
+**we cannot provide one for you**. Request yours at
+https://fred.stlouisfed.org/docs/api/api_key.html (approval is usually quick, but
+allow some time). A description like "Requesting an API key to explore the
+effectiveness of various forecasting techniques on economic data." works well.
+
+**Cutoff discipline.** Monthly adapters carry *approximate* `released_at`
+stamps that are optimistic by roughly one month (the lag is measured from
+the month-start timestamp; StatCan publishes ~3 weeks after the month
+ends). All predictors in this use case therefore drop the newest visible
+reference month of any monthly covariate — see
+`predictors/logistic_baseline.py::build_macro_snapshot` (levels plus the
+derived features; `build_feature_row` returns just the features), which both
+the logistic model and the agent prompt builder share. Notebook 01 demonstrates
+the full chain at a real origin.
+
+The preferred conventional specification uses separate CPI-median and CPI-trim
+gaps, alongside the Fed-BoC 2-year spread, rate momentum, yield spread, and
+unemployment momentum.
+
+**Maintenance:** extend `meeting_schedule.yaml` each year when the Bank
+publishes its next calendar (provenance notes are in the file header), and
+re-run `scripts/fetch_boc.py --refresh` to pick up new announcements.
+
+---
+
+## Predictors
+
+| Group | Predictor | Information set |
+|---|---|---|
+| Floor baseline | `CategoricalFrequencyPredictor` (core package) | Past outcomes only — the constant climatological distribution |
+| Conventional | `predictors/logistic_baseline.py` | Fit-at-origin multinomial logistic regression on four leak-safe macro features (yield spread, rate momentum, inflation gap, unemployment momentum); training features are rebuilt at each past meeting minus the task's own lead, so the train and predict feature distributions match; dispatches to plain logistic regression on binary tasks |
+| LLMP | `predictors/llmp_direction.py` → `CategoricalProbabilityLLMPredictor` | Labelled outcome history + BoC context block; one structured call, direct distribution elicitation. `predictors/llmp_binary.py` is the binary counterpart |
+| Agentic | `analyst_agent/` → `AgentPredictor` + `CategoricalAgentForecastOutput` | Rate path + decision history + **the same macro features as the logistic model**. The `build_boc_press_release_config` variant adds the Bank's latest press release (pass `press_releases=PressReleaseStore.from_cache()` to `build_boc_agent_predictor`); the `build_boc_labelled_snapshot_config` variant shows the same indicators with raw levels, reference months, and definitions (pass `labelled_snapshot=True`); the `build_boc_recent_base_rates_config` variant adds last-8-meeting base rates, the last decision, and its streak (pass `recent_base_rates=True`); `build_boc_press_release_recent_config` combines the press release and recent base rates (pass both); `build_boc_market_survey_config` / `build_boc_press_release_market_survey_config` add the latest Market Participants Survey (pass `market_surveys=MarketSurveyStore.from_cache()`) |
+
+Notebooks 02 and 03 run the press-release variant by default: in the
+side-by-side comparisons it beat the quantitative-only agent on both the
+pre-2025 backtest (RPS 0.0754 vs 0.0853) and the post-2025 eval (0.1017 vs
+0.1883, 11 vs 8 of 12 meetings called correctly), mostly by reading pauses and
+hikes from the Bank's forward guidance. The quantitative-only
+`build_boc_basic_config` is kept (commented in each notebook) for the strict
+like-for-like comparison with the logistic model — identical indicators, so
+it isolates *conventional fitting* vs *LLM reasoning*. The agent
+also emits `reasoning` and `key_signals` per meeting — the input for the
+reasoning-alignment evaluator in `rationale_eval.py`, demonstrated
+end-to-end in notebook 03.
+
+> **Leakage note (cutoff posture).** Gemini's parametric knowledge cutoff is
+> ~January 2025, and for a discrete outcome a single recalled label is the whole
+> answer — so the 2010–2024 backtest RPS for the LLMP and agent is an **upper
+> bound** on live skill (the conventional rows are the honest backtest there).
+> The **post-2025 protected eval** (12 resolved meetings, Jan 2025 – Jun 2026) is
+> the honest LLM/agent scoreboard; notebook 02 §10 now runs it by default.
+
+---
+
+## Reference specs
+
+Five specs, two jobs — a pedagogical pre-2025 backtest (cutoff-safe baselines
+are honest; LLM/agent rows are an upper bound) and the honest post-2025 eval —
+plus two small single-purpose illustrations:
+
+```
+specs/
+├── boc_rate_direction_backtest.yaml      # CANONICAL backtest: T−28, 120 origins, 2010–2024 (3 easing + 3 tightening cycles)
+├── boc_rate_direction_smoke.yaml         # a 3-origin slice of the above (2024: one hold, two cuts) — fast dev loop
+├── boc_rate_direction_eval.yaml          # HONEST eval: T−28, 12 origins, Jan 2025 – Jun 2026, max_runs: 5 (no hikes in window)
+├── boc_rate_cut_smoke.yaml               # binary reference (cut vs no cut), Brier-scored — §3 warm-up
+└── boc_rate_direction_eve_smoke.yaml     # T−1 eve-of-decision diagnostic, 3 origins — §7 lead comparison
+```
+
+The post-2025 window is too scarce (12 meetings) to split into both a held-out
+eval and a separate LLM backtest, so there is no "recent backtest" tier: the
+deep pre-2025 history is the backtest surface (numerical methods + LLM
+upper-bound) and the 2025–26 window is reserved for the eval. Notebook 02
+sizes the main backtest (smoke slice vs full window) via `EXPERIMENT_CONFIG`;
+the warm-up and eve specs are always the small ones.
+
+**Comparing agent versions.** The agent's cache key (`predictor_id`) depends only
+on its config name and model, so a prompt or payload change overwrites (or, without
+`force_refresh`, silently reuses) the previous notebook result. To measure a change,
+snapshot each version under its own label (temperature 0, fixed seed) and diff the
+per-meeting RPS:
 
 ```bash
-eval "$(onboard --bootcamp-name agentic-forecasting --skip-test)"
+uv run python scripts/compare_boc_agent.py run baseline            # before the change
+uv run python scripts/compare_boc_agent.py run v2_my_change        # after the change
+uv run python scripts/compare_boc_agent.py compare baseline v2_my_change
 ```
 
-Headless verification (same checks as first-boot onboarding):
+Runs default to the 120-origin backtest (add `--spec boc_rate_direction_smoke.yaml`
+for a quick check) and are stored under `data/predictions/agent_compare/`. Iterate
+against the backtest, not the protected post-2025 eval. `judge <label>` scores a
+run's reasoning against the Bank's release for each meeting, and `--variant`
+selects a built-in configuration (`basic`, `press_releases`, `labelled_snapshot`,
+`recent_base_rates`, `press_releases_recent_base_rates`, `market_survey`,
+`press_releases_market_survey`, `press_releases_market_momentum`); `compare --since YYYY-MM-DD` restricts the
+comparison to meetings where a newer data source exists. To measure noise, re-run
+the baseline under a second label (and with `--seed`) before trusting small gaps.
+When you have a winner, score it and the baseline once each on the protected eval
+with `--spec boc_rate_direction_eval.yaml`; those runs count against the spec's
+`max_runs` budget in `data/eval_runs.yaml`, and a stored eval result is never
+re-run without `--force`.
 
-```bash
-uv sync --all-extras --dev --all-packages
-uv run pytest tests/test_integration.py -v
+---
+
+## Module layout
+
+```
+implementations/boc_rate_decisions/
+├── meeting_schedule.yaml  # curated BoC announcement calendar (source-cited)
+├── data.py                # build_boc_service(); direction/event derivation + validation
+├── press_releases.py      # PressReleaseStore: cutoff-aware press-release store + HTML extraction/caching helpers
+├── market_survey.py       # MarketSurveyStore: Market Participants Survey parser (policy-rate path table) + cutoff-aware store
+├── predictors/            # (multinomial) logistic baseline; direction + binary LLMP recipes
+├── analyst_agent/         # AgentConfig factories + prompt builder + predictor factory
+├── starter_agent/         # fresh, hackable agent template (toggleable search/code-exec + skills)
+├── analysis.py            # score leaderboard, one-vs-rest frames, calibration bins, rationales
+├── rationale_eval.py      # LLM-as-judge reasoning-alignment evaluator; reads Langfuse traces, pushes scores back
+├── plots.py               # decision timeline, reliability curve, rate-path chart
+├── specs/                 # direction + binary backtest / eval / smoke YAML
+├── 01_boc_data_exploration.ipynb           # framing, direction derivation, cutoff walkthrough
+├── 02_boc_rate_direction_experiment.ipynb  # binary warm-up + the 3-way experiment
+├── 03_rationale_alignment.ipynb            # reasoning-alignment evaluation (LLM-as-judge over traces)
+└── 99_starter_agent.ipynb                  # ← start here to build your own agent
 ```
 
-**Credential model:** bootcamp keys live in your shell environment. Optional personal keys (e.g. `FRED_API_KEY`) go in a `.env` only — see [`.env.example`](.env.example).
+Tests live under `implementations/tests/boc_rate_decisions/` (direction and
+event derivation semantics; feature leak-safety).
 
-### Verify your environment first
+---
 
-New to the project? Open [`implementations/getting_started/00_environment_check.ipynb`](implementations/getting_started/00_environment_check.ipynb) and run it top to bottom. It's a self-guided preflight that checks every major capability — proxy LLM inference, Langfuse, E2B code execution, StatCan/FRED data access, and a full end-to-end mini backtest — one cell at a time, and tells you exactly what to fix when something isn't set up (most often a missing or placeholder key in your `.env`). It's the fastest way to confirm setup before working through the reference implementations.
+## Notebooks
 
-### Populate the data cache
+| Notebook | Purpose |
+|---|---|
+| `01_boc_data_exploration.ipynb` | Problem framing (ordered decision vs time series), policy-rate history with cut/hold/hike markers, direction derivation + schedule validation, class imbalance and the climatology RPS floor (with the cumulative-Brier decomposition), cutoff discipline at a real origin. |
+| `02_boc_rate_direction_experiment.ipynb` | **Main experiment.** Binary warm-up (the copy-paste reference + RPS(K=2) ≡ Brier check), smoke/full config switch, cached backtests for all four predictors at the canonical T−28 lead, RPS leaderboard with skill scores, the T−28 vs T−1 lead-time comparison ("anticipation gap"), decision timeline (P(cut) and P(hike)), one-vs-rest reliability curves, agent-reasoning inspection, budget-gated protected eval. |
+| `03_rationale_alignment.ipynb` | **Reasoning-alignment evaluation.** Runs traced LLMP/agent forecasts, then judges each trace's `reasoning`/`key_signals` against the Bank's published press release with an LLM-as-judge (`rationale_eval.py`), pushing `rationale_alignment` (0–1) and `right_for_right_reasons` scores back to Langfuse. A *process* metric that complements RPS — most valuable exactly where backtest scores are least trustworthy (see the leakage note above). |
+| `99_starter_agent.ipynb` | **Your starter agent.** A fresh, hackable cut/hold/hike agent — *not* part of the experiment above. Toggleable news search + code execution and two lightweight tool-usage skills, with an interactive (Track 2) cell, one scored prediction (Track 1), and a "make it yours" guide. The place to start building your own. |
 
-Data is fetched once and cached locally (gitignored). Each implementation names the fetch script(s) it needs in its own `README.md` — for example `scripts/fetch_cpi.py` (getting started), `scripts/fetch_sp500_market.py` + `scripts/fetch_fred.py` (S&P 500), `scripts/fetch_wti.py` (energy), and `scripts/fetch_boc.py` and `scripts/fetch_boc_press_releases.py` (BoC). Run the relevant one before opening that implementation's notebooks:
+---
 
-```bash
-uv run python scripts/fetch_cpi.py
-```
+## Roadmap
 
-### Build the E2B sandbox image (agentic implementations only)
+### Implemented since the first draft
 
-Agentic forecasters can run code in an E2B cloud sandbox. Credentials for e2b should be automatically injected into the environment for bootcamp participants, and you can confirm successful setup by running [`00_environment_check.ipynb`](implementations/getting_started/00_environment_check.ipynb).
+1. **BoC communications ingestion.** `press_releases.py` fetches one rate
+   announcement per scheduled meeting (`scripts/fetch_boc_press_releases.py`),
+   caches them under `data/reports/boc_press_releases/`, and serves them
+   cutoff-aware through `PressReleaseStore` — releases published after the
+   forecast origin are never visible, exactly like series data.
+2. **Reasoning-alignment evaluation.** `rationale_eval.py` is an LLM-as-judge
+   that compares the forecaster's per-meeting `reasoning`/`key_signals`
+   against the Bank's published rationale and writes `rationale_alignment`
+   and `right_for_right_reasons` scores back to the Langfuse trace. Notebook
+   03 runs it end-to-end.
+3. **Press releases as agent context.** `build_boc_press_release_config`
+   adds the latest release visible at the origin (normally the previous
+   meeting's statement, with its forward guidance) to the agent's payload.
+   Measure it against the quantitative-only agent with
+   `scripts/compare_boc_agent.py run <label> --variant press_releases`, then
+   `judge` and `compare` for RPS and reasoning alignment. Because the agent
+   now reads the Bank's own wording, its alignment score partly reflects
+   echoing the previous statement — read it alongside RPS, not alone.
+4. **Labelled macro snapshot.** `build_boc_labelled_snapshot_config` keeps
+   the agent's information set but makes the snapshot self-describing: each
+   indicator's level (policy rate, 2-year yields, core CPI, unemployment)
+   next to its gap or change, the reference month of each monthly series,
+   and a `definitions` block. Compare it with
+   `scripts/compare_boc_agent.py run <label> --variant labelled_snapshot`.
+5. **Recent base rates.** `build_boc_recent_base_rates_config` adds a
+   `meeting_outcomes.recent` block — base rates over the last 8 meetings
+   (about one year), the last decision, and `consecutive_same_decisions` —
+   and tells the agent to anchor on it when it disagrees with the
+   full-history base rates. Compare it with
+   `scripts/compare_boc_agent.py run <label> --variant recent_base_rates`.
+6. **Combined context.** `build_boc_press_release_recent_config` gives the
+   agent both the latest press release and the recent base rates, without
+   asking it to cite its statistical anchor in `key_signals` (which the
+   alignment judge scores as off-target because the Bank never argues from
+   streaks). Run it with `--variant press_releases_recent_base_rates`.
+7. **Market Participants Survey as agent context.** `market_survey.py` parses
+   the Bank's quarterly survey of ~30 market participants; the agent payload
+   gains `latest_market_survey` — the expected policy-rate path, with the
+   forecast meeting's row (`at_forecast_meeting`, incl. the implied change vs
+   the current rate) picked out. `build_boc_market_survey_config` adds it to
+   the quantitative agent and `build_boc_press_release_market_survey_config`
+   to the press-release agent (`--variant market_survey` /
+   `press_releases_market_survey`). The survey starts in 2023, so measure it
+   with `compare --since 2023-02-07` on the backtest and on the post-2025 eval.
+   First measurement: it did **not** help. On the post-2025 eval the
+   press-release agent scored RPS 0.1017 without the survey and 0.1785 with it
+   (11 vs 8 of 12 meetings right); the survey is conducted 1–4 months before the
+   origin and lags turning points — its own implied call matched only 18 of the
+   27 covered meetings, below both agents. (That run used an earlier field that
+   compared the survey median with the current rate, which misread stale
+   surveys; the payload now reports `expected_move_at_meeting_pp`, the move the
+   survey expected at that meeting, which has not been re-evaluated.) The
+   default agent therefore stays `build_boc_press_release_config`.
+8. **Market momentum.** `build_boc_press_release_momentum_config` adds a
+   `market_momentum` block to the press-release agent: how the 2-year GoC
+   yield has moved over 4 weeks, since the last decision, and over 13 weeks
+   (the market adding or removing expected cuts). Changes are measured on the
+   yield itself, not on the yield-minus-policy-rate spread, which jumps
+   mechanically whenever the Bank moves (`yield_change_since` in
+   `predictors/logistic_baseline.py`; the logistic model's features are
+   unchanged). Run it with `--variant press_releases_market_momentum`.
 
-If this was unsuccessful, or if you prefer to run with E2B in an alternative environment, do this once before enabling code execution in `build_adk_agent`:
+### Remaining extensions — good participant projects
 
-1. Create a free account at [e2b.dev](https://e2b.dev) and copy your API key.
-2. Add it to your `.env` file alongside the other keys (see `.env.example`):
+**Start in [`99_starter_agent.ipynb`](99_starter_agent.ipynb)** — it ships a
+fresh, hackable agent and a hands-on "make it yours" guide for going further.
+Two substantive projects, each with an explicit seam in the code, are
+catalogued in [`planning-docs/roadmap.md`](../../planning-docs/roadmap.md):
 
-  ```
-   E2B_API_KEY=your_e2b_api_key
-  ```
-
-1. Build the template (takes a few minutes on first run):
-
-  ```bash
-   uv run --env-file .env scripts/build_e2b_template.py
-  ```
-
-The template name is the default in `CodeExecutionConfig.template_name`, so notebooks pick it up automatically.
-
-## Core concepts
-
-`Predictor` is the interface every forecasting method implements:
-
-```python
-class MyPredictor(Predictor):
-    @property
-    def predictor_id(self) -> str:
-        return "my_predictor"
-
-    def predict(self, task: ForecastingTask, context: ForecastContext) -> list[Prediction]:
-        series = context.get_series(task.target_series_id)
-        ...
-        return [Prediction(...)]
-```
-
-`ForecastContext` is cutoff-scoped. Predictors only see observations available as of the forecast origin, which keeps backtests honest.
-
-`backtest()` is the open iteration loop against historical data. `evaluate()` is the budgeted protected-window loop.
-
-## Extending the foundation
-
-This repo is a starting point, not a finished product. The shape of a new forecaster is always the same: implement `Predictor`, declare a spec, and run `backtest()` / `evaluate()` to compare it against the baselines. Each reference implementation's README ends with concrete extension ideas; `planning-docs/roadmap.md` collects the cross-cutting ones (new data sources, additional methods, live forecasting, deeper agent work).
-
-## Code quality
-
-```bash
-make lint
-make format
-```
-
-`make lint` runs the expected pre-push quality checks. Git commits do not run hooks locally. To mirror the full pre-commit suite, run:
-
-```bash
-uv run pre-commit run --all-files
-```
-
-## Documentation
-
-- Per-implementation READMEs under [`implementations/`](implementations/) — the primary user surface.
-- [`guides/`](guides/) — self-contained, step-by-step strategy guides for the most common build-phase tasks: onboarding a dataset, creating an experiment, customizing an agent's strategy, and auditing a result before you believe it. [Guide 5](guides/05-access-adk-web-via-ssh-tunnel.md) is how you serve the concierge or any bootcamp agent under `adk web` (and tunnel that UI from Coder to your laptop).
-- [Architecture atlas](https://vectorinstitute.github.io/agentic-forecasting/architecture-atlas.html) ([source](docs/architecture-atlas.html)) — a self-contained visual atlas of the system architecture: the loop, the temporal fence, predictor families, the harness, agent anatomy, and how each reference implementation instantiates them.
-- [`aieng-forecasting/README.md`](aieng-forecasting/README.md) and [`aieng-forecasting/aieng/forecasting/methods/README.md`](aieng-forecasting/aieng/forecasting/methods/README.md) — the library and the method catalog.
-- [`planning-docs/roadmap.md`](planning-docs/roadmap.md) — architecture principles and extension ideas.
-
-Keep code, notebooks, specs, and these docs in sync when you change behavior, setup, layout, or datasets.
+1. **More Bank communications as predictor context** — the agent already
+   reads the latest press release; extend the same idea to the LLMP (via
+   `CategoricalProbabilityLLMPredictorConfig.user_prompt_suffix`), to several
+   past releases or Monetary Policy Reports (e.g. as a retrieval tool in place
+   of the `build_boc_news_config` web search), and measure the lift.
+2. **Live forecasting** — forecast each upcoming announcement the day before it
+   happens: genuinely out-of-sample, and the honest test backtest leakage
+   precludes.
